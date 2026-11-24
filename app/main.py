@@ -7,7 +7,7 @@ POST /withdrawals                 atomic batch take-down
 GET  /images                      catalog query (active by default)
 GET  /images/{sheet_no}           one sheet
 GET  /withdrawals                 audit trail of committed/rejected batches
-POST /admin/reinitialize          rebuild SQLite from the JSON catalog
+POST /admin/reinitialize          reconcile SQLite with the JSON catalog
 
 Interactive docs: /docs (Swagger UI), /redoc.
 """
@@ -18,7 +18,6 @@ import sqlite3
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
 
 from . import config, database
 from .schemas import (
@@ -26,6 +25,7 @@ from .schemas import (
     ErrorResponse,
     HealthResponse,
     ImageOut,
+    ReinitializeResponse,
     WithdrawRequest,
     WithdrawResponse,
 )
@@ -150,13 +150,29 @@ def get_batches(
     return out
 
 
-@app.post("/admin/reinitialize", tags=["system"])
+@app.post(
+    "/admin/reinitialize",
+    response_model=ReinitializeResponse,
+    tags=["system"],
+    responses={
+        400: {"model": ErrorResponse, "description": "Malformed catalog JSON"},
+        503: {"model": ErrorResponse, "description": "Database busy"},
+    },
+)
 def reinitialize(
     force: bool = Query(
-        False, description="true: drop and rebuild the catalog from JSON"
+        False,
+        description=(
+            "true: reconcile the catalog with the JSON. Sheets already "
+            "matching the JSON and still on the shelf are not rewritten; "
+            "only changed/missing/withdrawn sheets are written. The take-down "
+            "audit trail is cleared."
+        ),
     )
-) -> JSONResponse:
+) -> ReinitializeResponse:
     try:
-        return JSONResponse(database.initialize_database(force=force))
+        return database.initialize_database(force=force)
     except (database.CatalogError, FileNotFoundError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail=f"bad catalog: {exc}")
+    except sqlite3.OperationalError as exc:  # busy beyond the retry budget
+        raise HTTPException(status_code=503, detail=f"database busy: {exc}")

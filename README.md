@@ -30,7 +30,7 @@ app/
   main.py        FastAPI 路由
 data/
   catalog.json   演示目录（EPSG:32650，同一测绘期 2024Q3，17 张，16 个场景）
-tests/           35 项 pytest（几何单测 / API 规则 / 多线程并发）
+tests/           54 项 pytest（几何单测 / API 规则 / 多线程并发 / 重建对账）
 Dockerfile, docker-compose.yml, requirements*.txt, pytest.ini
 ```
 
@@ -67,6 +67,8 @@ SQLite 表：`images`（片号、测绘期、矩形四角、分辨率、文件�
   但本批提交前看到的一定是最新在架状态。
 - 锁冲突走 `busy_timeout` + 指数退避重试（默认 5 次），耗尽返回 503。
 - 拒绝批次的审计记录用独立事务写入，不随校验事务回滚而丢失。
+- 强制重建的比对在写锁之外，切库时用 `data_version` 栅栏确认比对后无他人提交，
+  否则基于新状态重新比对；详见上文「重建（force=true）的语义」。
 
 ## 运行
 
@@ -79,8 +81,35 @@ docker compose up --build
 ```
 
 `./data` 挂载到容器 `/data`：JSON 只读，SQLite 库 `imagery.db` 在该目录内生成。
-改了 JSON 后可在 Swagger 调 `POST /admin/reinitialize?force=true` 重建库
-（不带 `force` 时已初始化的库保持不变，幂等）。
+换了 JSON 源目录后，在 Swagger 调 `POST /admin/reinitialize?force=true` 发布：
+按当前 JSON **对账** SQLite，而不是整表重写（不带 `force` 时已初始化的库保持不变，幂等）。
+
+### 重建（force=true）的语义
+
+- **最小写入**：与 JSON 完全一致且仍在架的图幅不重写（行 `id`、`is_active`
+  原样保留）；只写差异——新增、属性变更（测绘期/四角/分辨率/文件路径）、
+  被下架需恢复在架的（`is_active=1`）、以及 JSON 中已不存在的片号（删除）。
+  全部一致时零图像写入。
+- **比对不占写锁**：整表比对在 `BEGIN IMMEDIATE` 之前用普通读完成，期间其他
+  重建和下架都能正常提交（自动提交模式下逐条 SELECT，不持读锁）。
+- **快照栅栏**：开始写事务时用 `PRAGMA data_version` 检测比对之后是否有人先提交；
+  若有则丢弃旧差异、按新状态重新比对再写。JSON 只在请求开始时读一次，因此
+  无论重试多少轮，最终结果都严格对应**本次读取的 JSON**：源中没有的片号删除，
+  源中的图幅全部在架。
+- **元数据随图幅更新**：`crs` / `units` 与图幅在同一次提交里更新。
+- **流水清空**：与旧行为一致，强制重建会清空 `withdrawal_batches`（本就是空表时
+  不产生写）。
+- **失败零变更**：JSON 校验失败（400）或写入中途出错，整个事务回滚，目录与
+  流水都保持调用前状态。等待锁/快照稳定超过重试预算返回 503。
+
+响应示例（`changes` 为本次实际写入的行数，可直接核对没被重写的图幅）：
+
+```json
+{"initialized":true,"rebuilt":true,"changed":true,"image_count":17,
+ "crs":"EPSG:32650",
+ "changes":{"inserted":1,"updated":1,"reactivated":1,"deleted":1,
+            "unchanged":14,"audit_cleared":2}}
+```
 
 ### 本地直接运行（无 Docker 时）
 
@@ -102,7 +131,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 | GET | `/images?active=true` | 在架目录（`active=false` 查全目录含已下架） |
 | GET | `/images/{sheet_no}` | 单片查询 |
 | GET | `/withdrawals?limit=50` | 提交/拒绝审计流水 |
-| POST | `/admin/reinitialize?force=false` | 从 JSON 初始化/重建 SQLite |
+| POST | `/admin/reinitialize?force=false` | 从 JSON 初始化/重建 SQLite（force 时按最小差异对账） |
 
 成功响应示例：
 
@@ -124,7 +153,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-python -I -m pytest -q
+python -m pytest -q
 ```
 
 ---
@@ -144,26 +173,32 @@ python -I -m pytest -q
 - 审计流水（含拒绝原因、失败片号、缺口矩形）；在架目录/全目录/单片查询；
   Swagger UI 与 OpenAPI schema；Dockerfile + docker-compose + 健康检查；
   全程只更新 `is_active`，不触碰影像文件，JSON 源目录哈希实测不变。
+- **force 重建改为按最小差异对账**：一致的在架图幅不重写（保留行 `id`），
+  只写新增/属性变更/恢复在架/删除；整表比对在写锁之外，`data_version`
+  栅栏保证比对后被别人抢先提交时按新状态重算而结果仍对应本次读到的 JSON；
+  `crs`/`units` 与图幅同一事务更新；流水照旧清空；校验或写入失败整体回滚。
 
 ## 实际验证过什么
 
-- **35 项 pytest 全部通过**（`python -I -m pytest`），含 12 项几何单测、
-  18 项 API 规则测试（成功批、拼合覆盖、缺口 409、粗分辨率拒绝、未知片号、
-  重复下架、混合批原子性、批内成员不得互相覆盖、去重、空批 422、审计流水、
-  重建幂等、JSON 不被改写）、5 项多线程并发测试；并发套连续重复 5 轮无抖动。
-- 测试中发现并修复了一个真实缺陷：拒绝审计原本写在校验事务内，随回滚丢失；
-  已改为独立事务写入并补回归测试。
-- 真实 uvicorn 进程 + curl/urllib 端到端实测 15 个场景：3 个成功批
-  （单张拼合覆盖、同足迹精细替代、两张一批）、4 类缺口拒绝（半幅、粗分辨率、
-  内部空洞、边缘 100m 缺口，返回矩形坐标逐一核对正确）、已下架/未知片号拒绝、
-  混合批整批不生效且其他片号仍在架、在架数 17→15 与提交结果一致、
-  审计流水 3 committed / 7 rejected、`catalog.json` md5 前后一致、
-  库里 `file_path` 原样保留仅 `is_active` 变化。
-- 真实 HTTP 并发竞争：两片号各自单独可撤、联合必撤穿的场景下多轮验证
-  恰好一个提交一个拒绝；同片号并发只有一个提交；4 请求并发（含必失败批）
-  无丢失更新，拒绝原因与最终在架状态自洽。
-- `/docs` 返回 200，OpenAPI 列出全部 6 个路径；`docker-compose.yml` YAML
-  解析通过，全部源码 `py_compile` 通过。
+- **54 项 pytest 全部通过**（`python -m pytest -q`，连跑 3 次稳定）：原 35 项
+  几何/API/并发测试全部保持通过，新增 19 个重建用例（14 个函数，含 6 个参数化
+  非法 JSON）——同步时零图像写入且行 `id` 不变、差异重建只产生 4 条预期写入
+  （增/改/恢复/删）、仅流水非空时只清流水、仅元数据变化不碰图像、比对暂停期间
+  下架可提交且事后被恢复在架、两笔重建交错时后完成者发布自己读到的 JSON
+  （片号集合与 CRS 均对应）、他人持写锁时读比对不受阻且等锁后按新状态收敛、
+  空操作重建不改变 `data_version`、6 类非法 JSON 均 400 且目录/流水逐行不变、
+  写入中途异常整体回滚。
+- 重建测试用 SQLite 触发器记录 `images` 的每一条 INSERT/UPDATE/DELETE，
+  直接断言"哪些行被写了"，而不是只看最终状态。
+- 真实 uvicorn 进程 + urllib 端到端：同 JSON 重建返回 `changed=false` 且行
+  `id` 不变；下架后重建只 `reactivated=1, unchanged=16`；换源（删 1、改分辨率 1、
+  增 1、改 CRS/单位）后重建计数与库内容/`/health` 全部一致、幂等重跑 `changed=false`。
+- 真实 HTTP 交错压测：3 个下架线程 + 2 个重建线程并发 6 秒，无错误、
+  无意外写入；最终重建后片号集合、分辨率、bbox、测绘期与 JSON 逐项相等，
+  全部在架，`PRAGMA integrity_check` 为 `ok`。另以 3 下架 + 2 重建直连事务层
+  压测 6 秒，同样零错误、零重复/缺失片号。
+- `/docs` 返回 200，OpenAPI 中 `/admin/reinitialize` 的 200 响应引用
+  `ReinitializeResponse`（含 `changes` 字段）；全部源码 `py_compile` 通过。
 
 ## 没完成 / 受限项
 
@@ -177,4 +212,6 @@ python -I -m pytest -q
 - 未引入 SQL 迁移工具（Alembic 等）：表结构随初始化脚本创建，结构变更目前
   靠 `force` 重建；因下架只改标记位、源数据在 JSON，重建不丢业务状态语义，
   但正式环境仍建议补迁移方案。
+- 重建的差异比对按图幅逐行读入内存（17 张演示规模无压力）；超大目录
+  （数十万片）需要改为分块比对/临时表 diff，当前未实现。
 - 未提交 git commit（按约定需明确指示再提交）；工作区改动均已落盘可直接审阅。

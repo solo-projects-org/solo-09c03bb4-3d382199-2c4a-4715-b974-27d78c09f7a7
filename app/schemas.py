@@ -66,3 +66,28 @@ class HealthResponse(BaseModel):
     units: str | None
     active_images: int
     total_images: int
+
+
+class ReinitializeChanges(BaseModel):
+    """Rows actually written by a forced reconcile (zero writes when in sync)."""
+
+    inserted: int
+    updated: int
+    reactivated: int
+    deleted: int
+    unchanged: int
+    audit_cleared: int
+
+
+class ReinitializeResponse(BaseModel):
+    initialized: bool
+    rebuilt: bool | None = Field(
+        None, description="true when a database file already existed"
+    )
+    changed: bool | None = Field(
+        None, description="false when the database already matched the JSON"
+    )
+    image_count: int
+    crs: str | None = None
+    reason: str | None = None
+    changes: ReinitializeChanges | None = None
